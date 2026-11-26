@@ -1,0 +1,495 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Create project files
+        run: |
+          mkdir -p proj && cd proj
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+          rootProject.name = "AirHockey"
+          include(":app")
+          EOF_FILE
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          cat > gradle.properties <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          EOF_FILE
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.airhockey"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.airhockey"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              val ks = rootProject.file("debug.keystore")
+              if (ks.exists()) {
+                  signingConfigs.getByName("debug") {
+                      storeFile = ks
+                      storePassword = "android"
+                      keyAlias = "androiddebugkey"
+                      keyPassword = "android"
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("com.google.android.gms:play-services-nearby:19.3.0")
+          }
+          EOF_FILE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+              <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+              <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" android:maxSdkVersion="28" />
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:minSdkVersion="29" android:maxSdkVersion="32" />
+              <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" android:minSdkVersion="31" />
+              <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" android:minSdkVersion="31" />
+              <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:minSdkVersion="31" />
+              <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" android:usesPermissionFlags="neverForLocation" android:minSdkVersion="32" />
+              <uses-permission android:name="android.permission.VIBRATE" />
+              <application
+                  android:allowBackup="false"
+                  android:label="Air Hockey"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/airhockey
+          cat > app/src/main/java/com/example/airhockey/MainActivity.kt <<'EOF_FILE'
+          package com.example.airhockey
+
+          import android.Manifest
+          import android.annotation.SuppressLint
+          import android.app.Activity
+          import android.content.Context
+          import android.content.pm.PackageManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.VibrationEffect
+          import android.os.Vibrator
+          import android.os.VibratorManager
+          import android.view.WindowManager
+          import android.webkit.JavascriptInterface
+          import android.webkit.WebView
+          import com.google.android.gms.nearby.Nearby
+          import com.google.android.gms.nearby.connection.*
+          import org.json.JSONObject
+
+          class MainActivity : Activity() {
+              private lateinit var web: WebView
+              private lateinit var client: ConnectionsClient
+              private var peer: String? = null
+              private var pending: String? = null
+              private var requesting = false
+              private val sid = "com.example.airhockey"
+              private val strategy = Strategy.P2P_POINT_TO_POINT
+
+              @SuppressLint("SetJavaScriptEnabled")
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  client = Nearby.getConnectionsClient(this)
+                  web = WebView(this)
+                  web.settings.javaScriptEnabled = true
+                  web.settings.domStorageEnabled = true
+                  web.settings.mediaPlaybackRequiresUserGesture = false
+                  web.addJavascriptInterface(Bridge(), "Android")
+                  web.loadUrl("file:///android_asset/index.html")
+                  setContentView(web)
+              }
+
+              private fun js(type: String, data: String = "") {
+                  runOnUiThread {
+                      web.evaluateJavascript(
+                          "window.onNative(${JSONObject.quote(type)},${JSONObject.quote(data)})", null
+                      )
+                  }
+              }
+
+              private fun perms(): Array<String> = when {
+                  Build.VERSION.SDK_INT >= 33 -> arrayOf(
+                      Manifest.permission.BLUETOOTH_ADVERTISE, Manifest.permission.BLUETOOTH_CONNECT,
+                      Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.NEARBY_WIFI_DEVICES)
+                  Build.VERSION.SDK_INT >= 31 -> arrayOf(
+                      Manifest.permission.BLUETOOTH_ADVERTISE, Manifest.permission.BLUETOOTH_CONNECT,
+                      Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.ACCESS_FINE_LOCATION)
+                  Build.VERSION.SDK_INT >= 29 -> arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+                  else -> arrayOf(Manifest.permission.ACCESS_COARSE_LOCATION)
+              }
+
+              private fun withPerms(action: String) {
+                  val missing = perms().filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+                  if (missing.isEmpty()) {
+                      go(action)
+                  } else {
+                      pending = action
+                      requestPermissions(missing.toTypedArray(), 1)
+                  }
+              }
+
+              override fun onRequestPermissionsResult(code: Int, p: Array<out String>, r: IntArray) {
+                  super.onRequestPermissionsResult(code, p, r)
+                  val a = pending
+                  pending = null
+                  if (a != null) go(a)
+              }
+
+              private fun resetNearby() {
+                  client.stopAdvertising()
+                  client.stopDiscovery()
+                  client.stopAllEndpoints()
+                  peer = null
+                  requesting = false
+              }
+
+              private fun go(action: String) {
+                  resetNearby()
+                  if (action == "host") {
+                      client.startAdvertising("host", sid, life, AdvertisingOptions.Builder().setStrategy(strategy).build())
+                          .addOnSuccessListener { js("status", "advertising") }
+                          .addOnFailureListener { js("failed", it.message ?: "advertise") }
+                  } else {
+                      client.startDiscovery(sid, disc, DiscoveryOptions.Builder().setStrategy(strategy).build())
+                          .addOnSuccessListener { js("status", "discovering") }
+                          .addOnFailureListener { js("failed", it.message ?: "discover") }
+                  }
+              }
+
+              private val payload = object : PayloadCallback() {
+                  override fun onPayloadReceived(id: String, p: Payload) {
+                      p.asBytes()?.let { js("msg", String(it, Charsets.UTF_8)) }
+                  }
+                  override fun onPayloadTransferUpdate(id: String, u: PayloadTransferUpdate) {}
+              }
+
+              private val life = object : ConnectionLifecycleCallback() {
+                  override fun onConnectionInitiated(id: String, info: ConnectionInfo) {
+                      js("status", "connecting")
+                      client.acceptConnection(id, payload)
+                          .addOnFailureListener { requesting = false; js("failed", it.message ?: "accept") }
+                  }
+                  override fun onConnectionResult(id: String, res: ConnectionResolution) {
+                      if (res.status.isSuccess) {
+                          peer = id
+                          requesting = false
+                          client.stopAdvertising()
+                          client.stopDiscovery()
+                          js("connected")
+                      } else {
+                          requesting = false
+                          js("failed", "connection rejected " + res.status.statusCode)
+                      }
+                  }
+                  override fun onDisconnected(id: String) {
+                      peer = null
+                      requesting = false
+                      js("disconnected")
+                  }
+              }
+
+              private val disc = object : EndpointDiscoveryCallback() {
+                  override fun onEndpointFound(id: String, info: DiscoveredEndpointInfo) {
+                      if (requesting) return
+                      requesting = true
+                      js("status", "found")
+                      client.requestConnection("guest", id, life)
+                          .addOnFailureListener { requesting = false; js("failed", it.message ?: "request") }
+                  }
+                  override fun onEndpointLost(id: String) {}
+              }
+
+              inner class Bridge {
+                  @JavascriptInterface fun host() { runOnUiThread { withPerms("host") } }
+                  @JavascriptInterface fun join() { runOnUiThread { withPerms("join") } }
+                  @JavascriptInterface fun send(s: String) {
+                      peer?.let { client.sendPayload(it, Payload.fromBytes(s.toByteArray(Charsets.UTF_8))) }
+                  }
+                  @JavascriptInterface fun stop() { resetNearby() }
+                  @Suppress("DEPRECATION")
+                  @JavascriptInterface
+                  fun vibrate(pattern: String) {
+                      val p = pattern.split(",").mapNotNull { it.trim().toLongOrNull() }.toLongArray()
+                      if (p.isEmpty()) return
+                      val v: Vibrator? = if (Build.VERSION.SDK_INT >= 31) {
+                          getSystemService(VibratorManager::class.java)?.defaultVibrator
+                      } else {
+                          getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+                      }
+                      if (v == null) return
+                      if (Build.VERSION.SDK_INT >= 26) v.vibrate(VibrationEffect.createWaveform(p, -1))
+                      else v.vibrate(p, -1)
+                  }
+              }
+
+              override fun onDestroy() {
+                  resetNearby()
+                  super.onDestroy()
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/assets
+          cat > app/src/main/assets/index.html <<'EOF_FILE'
+          <!DOCTYPE html>
+          <html lang="fa" dir="rtl"><head><meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+          <title>Air Hockey</title>
+          <style>
+          *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;-webkit-user-select:none;user-select:none}
+          html,body{margin:0;height:100%;overflow:hidden;background:#0b1220;color:#fff;font-family:system-ui,sans-serif}
+          canvas{position:fixed;top:0;left:0;width:100%;height:100%;touch-action:none}
+          .ov{position:fixed;top:0;left:0;right:0;bottom:0;display:flex;overflow-y:auto;-webkit-overflow-scrolling:touch;background:rgba(5,10,20,.72);text-align:center;padding:16px}
+          .box{margin:auto;display:flex;flex-direction:column;align-items:center;width:100%;max-width:340px}.box>*{margin-top:6px;margin-bottom:6px}
+          .box h1{margin:0;font-size:30px}.box p{margin:0;font-size:14px;line-height:1.8;color:#c9d5ea}
+          button{border:0;border-radius:16px;background:#2f7de1;color:#fff;font-size:19px;padding:12px 24px;width:100%}
+          button.g{background:#2c3a55}.hide{display:none!important}
+          input{width:100%;border:2px solid #3a4b6b;border-radius:14px;background:rgba(0,0,0,.4);color:#fff;font-size:18px;padding:10px 14px;text-align:center;user-select:text;-webkit-user-select:text}
+          #themes{display:flex;justify-content:center}
+          .th{width:46px;height:46px;border-radius:50%;border:3px solid transparent;padding:0;margin:0 5px}
+          .th.on{border-color:#fff}
+          #list{width:100%;max-height:46vh;overflow-y:auto}
+          .it{background:rgba(255,255,255,.09);border-radius:12px;padding:8px 12px;margin:4px 0;font-size:13px;line-height:1.7}
+          </style></head><body>
+          <canvas id="c"></canvas>
+          <div class="ov" id="menu"><div class="box"><h1>Air Hockey</h1>
+          <input id="nm" maxlength="14" placeholder="اسم شما">
+          <div id="themes"></div><p id="tn"></p>
+          <p id="stat">دو گوشی کنار هم: یکی «ساخت بازی» و دیگری «پیوستن» رو بزنه.</p>
+          <button id="bh">ساخت بازی (میزبان)</button><button id="bj">پیوستن</button>
+          <button class="g" id="bs">تمرین تک‌نفره</button><button class="g" id="bhist">تاریخچه بازی‌ها</button></div></div>
+          <div class="ov hide" id="ov2"><div class="box"><h1 id="res"></h1><p id="det"></p><p id="rinfo"></p>
+          <button id="again">بازی دوباره</button><button class="g" id="home">منو</button></div></div>
+          <div class="ov hide" id="ov3"><div class="box"><h1>تاریخچه</h1><p id="sum"></p><div id="list"></div>
+          <button id="hclose">بستن</button><button class="g" id="hclear">پاک کردن تاریخچه</button></div></div>
+          <script>
+          var LW=400,LH=800,PR=18,PD=34,GOAL=170,WIN=13,MAXS=1300;
+          var role='none',st={px:200,py:400,vx:0,vy:0,hx:200,hy:700,gx:200,gy:100,hs:0,gs:0,ph:0,cd:0,hset:0,gset:0,sn:1};
+          var mine={x:200,y:700},gt={x:200,y:100},dp={x:200,y:400},dh={x:200,y:700};
+          var lastMsg=0,lastSend=0,last=0,over=false,hintT=null,setsList=[],myReady=false,oppReady=false;
+          var myName='بازیکن',oppName='حریف',themeIdx=0;
+          var $=function(i){return document.getElementById(i)};
+          function ls(k,v){try{if(v===undefined)return localStorage.getItem(k);localStorage.setItem(k,v)}catch(e){return null}}
+          function cleanName(s){return String(s||'').replace(/[|,;]/g,'').trim().slice(0,14)||'بازیکن'}
+          function vib(p){try{if(window.Android&&Android.vibrate)Android.vibrate(p)}catch(e){}}
+          /* ---------- themes ---------- */
+          var THEMES=[
+           {n:'نئون',bg:'#0b1220',rink:'#10233f',line:'#2c5a96',gH:'#4aa3ff',gG:'#ff5a6e',hp:'#4aa3ff',hp2:'#bfe0ff',gp:'#ff5a6e',gp2:'#ffd0d6',puck:'#ffffff',hud:'rgba(255,255,255,.5)',sw:'#2c5a96'},
+           {n:'یخی',bg:'#bcdcee',rink:'#eaf6fd',line:'#8fc3e3',gH:'#2f7de1',gG:'#e24a5f',hp:'#2f7de1',hp2:'#cfe3ff',gp:'#e24a5f',gp2:'#ffd3d9',puck:'#1b2a3a',hud:'rgba(20,40,70,.5)',sw:'#cfe8f5'},
+           {n:'چمن',bg:'#0f3d1f',rink:'#2e8b3e',line:'#bde8c2',gH:'#ffffff',gG:'#ffd24a',hp:'#1d4fd8',hp2:'#9db8ff',gp:'#d9342b',gp2:'#ffb3ae',puck:'#ffffff',hud:'rgba(255,255,255,.55)',sw:'#2e8b3e'},
+           {n:'آتشین',bg:'#1a0a08',rink:'#3a120c',line:'#ff7a3d',gH:'#ffb13d',gG:'#ff3d3d',hp:'#ffb13d',hp2:'#fff0c2',gp:'#ff3d3d',gp2:'#ffc2c2',puck:'#fff3d6',hud:'rgba(255,210,170,.5)',sw:'#ff7a3d'},
+           {n:'چوبی',bg:'#2b1a0e',rink:'#b9854f',line:'#6b4423',gH:'#2b5fb3',gG:'#a8321f',hp:'#2b5fb3',hp2:'#b6cdf2',gp:'#a8321f',gp2:'#f0b8ad',puck:'#1c1208',hud:'rgba(40,20,5,.55)',sw:'#b9854f'}
+          ];
+          themeIdx=+ls('hk_theme')||0;if(!THEMES[themeIdx])themeIdx=0;
+          function buildThemes(){var box=$('themes');box.innerHTML='';
+           THEMES.forEach(function(t,i){var b=document.createElement('button');b.className='th'+(i===themeIdx?' on':'');b.style.background=t.sw;
+            b.onclick=function(){themeIdx=i;ls('hk_theme',String(i));buildThemes()};box.appendChild(b)});
+           $('tn').textContent='تم: '+THEMES[themeIdx].n}
+          myName=cleanName(ls('hk_name')||'بازیکن');$('nm').value=myName;buildThemes();
+          /* ---------- audio ---------- */
+          var AC=null,ev=0,evn=0,seenEvn=0;
+          function unlock(){if(!AC){try{AC=new(window.AudioContext||window.webkitAudioContext)()}catch(e){}}if(AC&&AC.state==='suspended')AC.resume()}
+          ['pointerdown','pointerup','touchend','click'].forEach(function(n){document.addEventListener(n,unlock,true)});
+          function tone(f,d,ty,v,f2,delay){if(!AC)return;var t=AC.currentTime+(delay||0),o=AC.createOscillator(),g=AC.createGain();o.type=ty;o.frequency.setValueAtTime(f,t);if(f2)o.frequency.exponentialRampToValueAtTime(f2,t+d);g.gain.setValueAtTime(v,t);g.gain.exponentialRampToValueAtTime(.001,t+d);o.connect(g);g.connect(AC.destination);o.start(t);o.stop(t+d+.02)}
+          /* codes: 1 hit, 2 wall, 3 host scored, 6 guest scored, 4 win, 5 lose */
+          function play(k){
+           if(k===3||k===6){var iScored=(k===3)===(role!=='guest');vib(iScored?'0,90':'0,320');k=7}
+           else if(k===4)vib('0,80,60,80,60,220');else if(k===5)vib('0,500');
+           if(AC&&AC.state==='suspended')AC.resume();
+           if(k===1)tone(420,.08,'square',.12,180);else if(k===2)tone(200,.06,'triangle',.25,120);
+           else if(k===7){tone(523,.15,'sine',.3);tone(659,.15,'sine',.3,0,.12);tone(784,.3,'sine',.3,0,.24)}
+           else if(k===4){[523,659,784,1047].forEach(function(f,i){tone(f,.2,'triangle',.3,0,i*.15)})}
+           else if(k===5){[400,330,260,200].forEach(function(f,i){tone(f,.25,'sawtooth',.15,0,i*.18)})}}
+          function emit(k){ev=k;evn++;play(k)}
+          /* ---------- canvas ---------- */
+          var cv=$('c'),ctx=cv.getContext('2d'),W,H,S,OX,OY,DPR;
+          function rs(){DPR=devicePixelRatio||1;W=innerWidth;H=innerHeight;cv.width=W*DPR;cv.height=H*DPR;S=Math.min(W/LW,H/LH);OX=(W-LW*S)/2;OY=(H-LH*S)/2}
+          rs();addEventListener('resize',rs);
+          function send(s){if(window.Android)Android.send(s)}
+          function clamp(v,a,b){return Math.max(a,Math.min(b,v))}
+          function setMine(cx,cy){var x=(cx-OX)/S,y=(cy-OY)/S;if(role==='guest'){x=LW-x;y=LH-y}
+           mine.x=clamp(x,PD,LW-PD);mine.y=role==='guest'?clamp(y,PD,LH/2-PD):clamp(y,LH/2+PD,LH-PD)}
+          cv.addEventListener('pointerdown',function(e){e.preventDefault();setMine(e.clientX,e.clientY)});
+          cv.addEventListener('pointermove',function(e){e.preventDefault();setMine(e.clientX,e.clientY)});
+          /* ---------- game logic (host) ---------- */
+          function newMatch(){st.hs=0;st.gs=0;st.hset=0;st.gset=0;st.sn=1;setsList=[];myReady=false;oppReady=false;
+           st.px=LW/2;st.py=LH/2;st.vx=0;st.vy=0;st.hx=mine.x;st.hy=mine.y;st.gx=LW/2;st.gy=100;gt.x=LW/2;gt.y=100;
+           st.ph=1;st.cd=2.5;over=false;$('ov2').classList.add('hide')}
+          function goal(w){emit(w?3:6);st.px=LW/2;st.py=w?LH*.36:LH*.64;st.vx=0;st.vy=0;
+           if(st.hs>=WIN||st.gs>=WIN){setsList.push([st.hs,st.gs]);if(w)st.hset++;else st.gset++;
+            if(st.hset>=2||st.gset>=2)st.ph=3;else{st.sn++;st.hs=0;st.gs=0;st.ph=1;st.cd=2.5}}
+           else{st.ph=1;st.cd=1.5}}
+          function hit(x,y,pvx,pvy){var dx=st.px-x,dy=st.py-y,d=Math.sqrt(dx*dx+dy*dy),m=PR+PD;
+           if(d<m&&d>0){var nx=dx/d,ny=dy/d;st.px=x+nx*m;st.py=y+ny*m;
+            var vn=(st.vx-pvx)*nx+(st.vy-pvy)*ny;
+            if(vn<0){if(vn<-60)emit(1);st.vx-=1.9*vn*nx;st.vy-=1.9*vn*ny}
+            var sp=Math.sqrt(st.vx*st.vx+st.vy*st.vy);if(sp>MAXS){st.vx*=MAXS/sp;st.vy*=MAXS/sp}}}
+          function hostUpdate(dt){
+           var ohx=st.hx,ohy=st.hy,ogx=st.gx,ogy=st.gy;st.hx=mine.x;st.hy=mine.y;
+           if(role==='solo'){var ty=st.py<LH/2?Math.max(PD,st.py-50):120;ty=clamp(ty,PD,LH/2-PD);
+            st.gx+=clamp(st.px-st.gx,-260*dt,260*dt);st.gy+=clamp(ty-st.gy,-260*dt,260*dt)}
+           else{var k=Math.min(1,dt*25);st.gx+=(gt.x-st.gx)*k;st.gy+=(gt.y-st.gy)*k}
+           if(dt<=0)return;
+           var hv={x:clamp((st.hx-ohx)/dt,-1800,1800),y:clamp((st.hy-ohy)/dt,-1800,1800)};
+           var gv={x:clamp((st.gx-ogx)/dt,-1800,1800),y:clamp((st.gy-ogy)/dt,-1800,1800)};
+           if(st.ph===1){st.cd-=dt;if(st.cd<=0)st.ph=2;return}
+           if(st.ph!==2)return;
+           var n=Math.ceil(dt/0.004),h=dt/n;
+           for(var i=0;i<n;i++){
+            st.px+=st.vx*h;st.py+=st.vy*h;var f=Math.pow(.7,h);st.vx*=f;st.vy*=f;
+            if(st.px<PR){st.px=PR;if(st.vx<-80)emit(2);st.vx=Math.abs(st.vx)*.92}
+            if(st.px>LW-PR){st.px=LW-PR;if(st.vx>80)emit(2);st.vx=-Math.abs(st.vx)*.92}
+            var ing=Math.abs(st.px-LW/2)<GOAL/2;
+            if(st.py<PR&&!ing){st.py=PR;if(st.vy<-80)emit(2);st.vy=Math.abs(st.vy)*.92}
+            if(st.py>LH-PR&&!ing){st.py=LH-PR;if(st.vy>80)emit(2);st.vy=-Math.abs(st.vy)*.92}
+            hit(st.hx,st.hy,hv.x,hv.y);hit(st.gx,st.gy,gv.x,gv.y);
+            if(st.py<-PR){st.hs++;goal(1);break}
+            if(st.py>LH+PR){st.gs++;goal(0);break}
+            var sp=Math.sqrt(st.vx*st.vx+st.vy*st.vy);if(sp>MAXS){st.vx*=MAXS/sp;st.vy*=MAXS/sp}}}
+          /* ---------- network messages ---------- */
+          function setsStr(){return setsList.map(function(s){return s[0]+'-'+s[1]}).join(';')}
+          function onMsg(m){var i=m.indexOf('|'),k=m.slice(0,i),r=m.slice(i+1);
+           if(k==='s'){var q=r.split('|'),a=q[0].split(',').map(Number);
+            st.px=a[0];st.py=a[1];st.vx=a[2];st.vy=a[3];st.hx=a[4];st.hy=a[5];st.hs=a[6];st.gs=a[7];st.ph=a[8];st.cd=a[9]/10;
+            st.hset=a[12];st.gset=a[13];st.sn=a[14];
+            setsList=(q[1]||'').split(';').filter(Boolean).map(function(x){var y=x.split('-');return[+y[0],+y[1]]});
+            if(!lastMsg)seenEvn=a[11];else if(a[11]!==seenEvn){seenEvn=a[11];play(a[10])}
+            lastMsg=performance.now()}
+           else if(k==='p'){var b=r.split(',').map(Number);gt.x=clamp(b[0],PD,LW-PD);gt.y=clamp(b[1],PD,LH/2-PD)}
+           else if(k==='n'){oppName=cleanName(r)}
+           else if(k==='q'){oppReady=true;updRinfo();if(role==='host'&&myReady)newMatch()}}
+          function updRinfo(){$('rinfo').textContent=myReady?(oppReady?'':'منتظر حریف...'):(oppReady?'حریف بازی دوباره می‌خواد':'')}
+          window.onNative=function(t,d){
+           if(t==='status'){var m={advertising:'منتظر بازیکن دوم... روی گوشی دوم «پیوستن» رو بزن.',discovering:'در حال جستجوی میزبان...',found:'میزبان پیدا شد، در حال اتصال...',connecting:'در حال برقراری اتصال...'};$('stat').textContent=m[d]||d}
+           else if(t==='connected'){if(role!=='host'&&role!=='guest')return;clearTimeout(hintT);$('menu').classList.add('hide');
+            send('n|'+myName);
+            if(role==='host')newMatch();else{st.ph=0;lastMsg=0;dp.x=st.px;dp.y=st.py;dh.x=st.hx;dh.y=st.hy}}
+           else if(t==='failed'||t==='disconnected'){clearTimeout(hintT);if(t==='failed'&&window.Android)Android.stop();
+            role='none';st.ph=0;over=false;$('ov2').classList.add('hide');$('menu').classList.remove('hide');
+            $('stat').textContent=(t==='failed'?'اتصال برقرار نشد: ':'ارتباط قطع شد: ')+d+' (بلوتوث هر دو گوشی روشن باشه)'}
+           else if(t==='msg')onMsg(d)};
+          /* ---------- menu ---------- */
+          function pick(r){role=r;mine=r==='guest'?{x:200,y:100}:{x:200,y:700};clearTimeout(hintT);
+           myName=cleanName($('nm').value);ls('hk_name',myName);oppName=r==='solo'?'کامپیوتر':'حریف';
+           if(r!=='solo')hintT=setTimeout(function(){if(!$('menu').classList.contains('hide'))$('stat').textContent+=' | اگه وصل نشد: بلوتوث هر دو گوشی روشن و گوشی‌ها کنار هم باشن.'},20000)}
+          $('bh').onclick=function(){if(!window.Android){$('stat').textContent='برای اتصال بلوتوث باید داخل اپ اندروید باشی.';return}pick('host');$('stat').textContent='...';Android.host()};
+          $('bj').onclick=function(){if(!window.Android){$('stat').textContent='برای اتصال بلوتوث باید داخل اپ اندروید باشی.';return}pick('guest');$('stat').textContent='...';Android.join()};
+          $('bs').onclick=function(){pick('solo');$('menu').classList.add('hide');newMatch()};
+          $('again').onclick=function(){if(myReady)return;myReady=true;
+           if(role==='solo'){newMatch();return}
+           send('q|1');if(role==='host'&&oppReady){newMatch();return}updRinfo()};
+          $('home').onclick=function(){if(window.Android)Android.stop();location.reload()};
+          /* ---------- history ---------- */
+          function hist(){try{return JSON.parse(ls('hk_hist')||'[]')}catch(e){return[]}}
+          function saveMatch(){var g=role==='guest',my=g?st.gset:st.hset,op=g?st.hset:st.gset;
+           var sets=setsList.map(function(s){return g?[s[1],s[0]]:[s[0],s[1]]});
+           var h=hist();h.unshift({t:Date.now(),me:myName,opp:oppName,ms:my,os:op,sets:sets,mode:role});ls('hk_hist',JSON.stringify(h.slice(0,200)))}
+          function showHist(){var h=hist(),w=0;h.forEach(function(m){if(m.ms>m.os)w++});
+           $('sum').textContent='کل بازی‌ها: '+h.length+' | برد: '+w+' | باخت: '+(h.length-w);
+           var box=$('list');box.innerHTML='';
+           if(!h.length)box.textContent='هنوز بازی‌ای ثبت نشده.';
+           h.forEach(function(m){var d=document.createElement('div');d.className='it';var D=new Date(m.t);
+            d.textContent=m.me+' '+m.ms+' - '+m.os+' '+m.opp+'  ('+m.sets.map(function(s){return s[0]+'-'+s[1]}).join(' ، ')+')  '+D.toLocaleDateString('fa-IR')+' '+D.toLocaleTimeString('fa-IR',{hour:'2-digit',minute:'2-digit'});
+            box.appendChild(d)});
+           $('ov3').classList.remove('hide')}
+          $('bhist').onclick=showHist;$('hclose').onclick=function(){$('ov3').classList.add('hide')};
+          $('hclear').onclick=function(){ls('hk_hist','[]');showHist()};
+          /* ---------- drawing ---------- */
+          function circ(x,y,r,c){ctx.fillStyle=c;ctx.beginPath();ctx.arc(x,y,r,0,6.3);ctx.fill()}
+          function draw(){
+           var T=THEMES[themeIdx];
+           ctx.setTransform(DPR,0,0,DPR,0,0);ctx.fillStyle=T.bg;ctx.fillRect(0,0,W,H);
+           ctx.translate(OX,OY);ctx.scale(S,S);
+           if(role==='guest'){ctx.translate(LW,LH);ctx.rotate(Math.PI)}
+           ctx.fillStyle=T.rink;ctx.fillRect(0,0,LW,LH);
+           ctx.strokeStyle=T.line;ctx.lineWidth=4;ctx.strokeRect(2,2,LW-4,LH-4);
+           ctx.beginPath();ctx.moveTo(0,LH/2);ctx.lineTo(LW,LH/2);ctx.stroke();
+           ctx.beginPath();ctx.arc(LW/2,LH/2,60,0,6.3);ctx.stroke();
+           ctx.fillStyle=T.gG;ctx.fillRect((LW-GOAL)/2,0,GOAL,8);
+           ctx.fillStyle=T.gH;ctx.fillRect((LW-GOAL)/2,LH-8,GOAL,8);
+           var g=role==='guest',px=g?dp.x:st.px,py=g?dp.y:st.py;
+           var hx=g?dh.x:st.hx,hy=g?dh.y:st.hy,gx=g?mine.x:st.gx,gy=g?mine.y:st.gy;
+           circ(hx,hy,PD,T.hp);circ(hx,hy,PD*.45,T.hp2);
+           circ(gx,gy,PD,T.gp);circ(gx,gy,PD*.45,T.gp2);
+           circ(px,py,PR,T.puck);
+           ctx.setTransform(DPR,0,0,DPR,0,0);
+           var my=g?st.gs:st.hs,op=g?st.hs:st.gs,mS=g?st.gset:st.hset,oS=g?st.hset:st.gset,y0=H/2;
+           if(role!=='none'){
+            ctx.textAlign='left';ctx.fillStyle=T.hud;
+            ctx.font='bold 15px system-ui';ctx.fillText(oppName+' · ست '+oS,12,y0-62);
+            ctx.font='bold 40px system-ui';ctx.fillText(op,12,y0-16);ctx.fillText(my,12,y0+40);
+            ctx.font='bold 15px system-ui';ctx.fillText(myName+' · ست '+mS,12,y0+66);
+            if(st.ph>0){ctx.textAlign='center';ctx.fillText('ست '+st.sn+' از ۳ · تا '+WIN+' امتیاز',W/2,Math.max(OY,0)+24)}}
+           ctx.textAlign='center';ctx.fillStyle='#fff';ctx.strokeStyle='rgba(0,0,0,.6)';ctx.lineWidth=5;
+           if(st.ph===0&&role==='guest'){ctx.font='bold 26px system-ui';ctx.strokeText('در انتظار میزبان...',W/2,H/2);ctx.fillText('در انتظار میزبان...',W/2,H/2)}
+           if(st.ph===1&&role!=='none'){ctx.font='bold 48px system-ui';var tx=st.cd>1.5?'ست '+st.sn:st.cd>1?'آماده؟':'برو!';ctx.strokeText(tx,W/2,H/2);ctx.fillText(tx,W/2,H/2)}
+           if(st.ph===3&&!over){over=true;var won=mS>oS;play(won?4:5);saveMatch();
+            $('res').textContent=won?'بردی!':'باختی';
+            $('det').textContent='ست‌ها '+mS+' - '+oS+' ('+setsList.map(function(s){return g?s[1]+'-'+s[0]:s[0]+'-'+s[1]}).join(' ، ')+')';
+            updRinfo();$('ov2').classList.remove('hide')}
+           else if(st.ph!==3&&over){over=false;myReady=false;oppReady=false;$('ov2').classList.add('hide')}}
+          function loop(t){var dt=Math.min(.05,(t-last)/1000||0);last=t;
+           if(role==='host'||role==='solo'){hostUpdate(dt);
+            if(role==='host'&&t-lastSend>33){lastSend=t;
+             send('s|'+[st.px,st.py,st.vx,st.vy,st.hx,st.hy,st.hs,st.gs,st.ph,st.cd*10,ev,evn,st.hset,st.gset,st.sn].map(Math.round).join(',')+'|'+setsStr())}}
+           else if(role==='guest'){var age=Math.min(.1,(t-lastMsg)/1000),k=Math.min(1,dt*30);
+            dp.x+=(st.px+st.vx*age-dp.x)*k;dp.y+=(st.py+st.vy*age-dp.y)*k;dh.x+=(st.hx-dh.x)*k;dh.y+=(st.hy-dh.y)*k;
+            if(t-lastSend>33){lastSend=t;send('p|'+Math.round(mine.x)+','+Math.round(mine.y))}}
+           draw();requestAnimationFrame(loop)}
+          requestAnimationFrame(loop);
+          </script></body></html>
+          EOF_FILE
+      - name: Add signing key
+        run: echo "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" | base64 -d > proj/debug.keystore
+      - name: Build
+        run: cd proj && gradle assembleDebug --no-daemon
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          files: proj/app/build/outputs/apk/debug/app-debug.apk
